@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 
 	"github.com/mark3labs/x402-go"
@@ -36,6 +37,7 @@ func NewX402Handler(mcpHandler http.Handler, config *Config) *X402Handler {
 
 // ServeHTTP intercepts HTTP requests to check for x402 payments
 func (h *X402Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	logger := slog.Default()
 	// Only intercept POST requests (JSON-RPC calls)
 	if r.Method != http.MethodPost {
 		h.mcpHandler.ServeHTTP(w, r)
@@ -126,7 +128,7 @@ func (h *X402Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	verifyResp, err := h.facilitator.Verify(ctx, payment, *requirement)
 	if err != nil {
 		if h.config.Verbose {
-			fmt.Printf("Payment verification failed: %v\n", err)
+			logger.Info("Payment verification failed", "error", err)
 		}
 		h.writeError(w, jsonrpcReq.ID, -32603, fmt.Sprintf("Verification failed: %v", err), nil)
 		return
@@ -134,7 +136,7 @@ func (h *X402Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if !verifyResp.IsValid {
 		if h.config.Verbose {
-			fmt.Printf("Payment rejected: %s\n", verifyResp.InvalidReason)
+			logger.Info("Payment rejected", "reason", verifyResp.InvalidReason)
 		}
 		h.writeError(w, jsonrpcReq.ID, 402, fmt.Sprintf("Payment invalid: %s", verifyResp.InvalidReason), nil)
 		return
@@ -209,6 +211,7 @@ func (h *X402Handler) sendPaymentRequiredError(w http.ResponseWriter, id interfa
 
 // forwardAndSettle executes the mcpHandler and on success, settles the payment and injects settlement response in result._meta
 func (h *X402Handler) forwardAndSettle(w http.ResponseWriter, r *http.Request, requestBody []byte, requestID interface{}, payment *x402.PaymentPayload, requirement *x402.PaymentRequirement, verifyResp *facilitator.VerifyResponse) {
+	logger := slog.Default()
 	// Create a response recorder to capture the MCP handler's response
 	recorder := &responseRecorder{
 		headerMap:  make(http.Header),
@@ -231,7 +234,7 @@ func (h *X402Handler) forwardAndSettle(w http.ResponseWriter, r *http.Request, r
 
 	if err := json.Unmarshal(recorder.body.Bytes(), &jsonrpcResp); err != nil {
 		if h.config.Verbose {
-			fmt.Printf("Failed to parse MCP response, skipping settlement: %v\n", err)
+			logger.ErrorContext(r.Context(), "Failed to parse MCP response, skipping settlement", "error", err)
 		}
 		// If we can't parse response, just forward it as-is
 		for k, v := range recorder.headerMap {
@@ -244,7 +247,7 @@ func (h *X402Handler) forwardAndSettle(w http.ResponseWriter, r *http.Request, r
 
 	if jsonrpcResp.Error != nil {
 		if h.config.Verbose {
-			fmt.Println("Execution failed. Payment will not be settled.")
+			logger.Info("Execution failed. Payment will not be settled.")
 		}
 		for k, v := range recorder.headerMap {
 			w.Header()[k] = v
@@ -258,7 +261,7 @@ func (h *X402Handler) forwardAndSettle(w http.ResponseWriter, r *http.Request, r
 	// Settle if not verify-only mode
 	if !h.config.VerifyOnly {
 		if h.config.Verbose {
-			fmt.Println("Execution successful. Settling payment.")
+			logger.Info("Execution successful. Settling payment.")
 		}
 		settleCtx, settleCancel := context.WithTimeout(r.Context(), x402.DefaultTimeouts.SettleTimeout)
 		defer settleCancel()
@@ -273,9 +276,8 @@ func (h *X402Handler) forwardAndSettle(w http.ResponseWriter, r *http.Request, r
 				reason = settleResp.ErrorReason
 			}
 
-			errorMsg := fmt.Sprintf("Settlement failed: %v", reason)
 			if h.config.Verbose {
-				fmt.Println(errorMsg)
+				logger.ErrorContext(r.Context(), "Settlement failed", "error", reason)
 			}
 			payer := ""
 			if verifyResp != nil {
@@ -289,10 +291,10 @@ func (h *X402Handler) forwardAndSettle(w http.ResponseWriter, r *http.Request, r
 					ErrorReason: reason,
 				},
 			}
-			h.writeError(w, requestID, -32603, errorMsg, errorData)
+			h.writeError(w, requestID, -32603, fmt.Sprintf("Settlement failed: %v", reason), errorData)
 			return
 		} else if h.config.Verbose {
-			fmt.Printf("Payment successful: %s\n", settleResp.Transaction)
+			logger.Info("Payment successful", "transaction", settleResp.Transaction)
 		}
 	}
 
